@@ -1,0 +1,14 @@
+[Unit]
+Description=Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/cloudflared tunnel run
+Restart=always
+User=adan
+Environment=HOME=/home/adan
+WorkingDirectory=/home/adan/.cloudflared
+
+[Install]
+WantedBy=multi-user.target

@@ -17,14 +17,24 @@ ng build --configuration production
 
 Copy the `dist/` files to the Raspberry Pi via SCP
 ```
-scp -r dist/edu-meilleur/* adan@<pi-ip>:/var/www/angular/
+scp -r dist/edu-meilleur/* adan@<pi-ip>:/home/adan/angular_tmp
+```
+
+Move the temporary files to the correct directory
+```
+sudo mv ~/angular_tmp/*  /var/www/angular/
+```
+
+Give permissions to the angular files so nginx can access them
+```
+ sudo chown -R www-data:www-data /var/www/angular
 ```
 
 ### ASP.Net Core
 
 publish on dev machine
 ```
-dotnet publish -c Release -r linux-arm --self-contained false -o ./publish
+dotnet publish -c Release -r linux-arm64 --self-contained false -o ./publish
 ```
 
 Copy the published files to the Raspberry Pi via SCP
@@ -37,7 +47,7 @@ On the Raspberry Pi, run the backend:
 cd /home/adan/eduMeilleurApi/
 dotnet EduMeilleurAPI.dll
 ```
-(Optional) Create a systemd service to run the backend automatically
+Create a systemd service to run the backend automatically
 ```
 [Unit]
 Description=EduMeilleur ASP.NET Core Web API
@@ -67,7 +77,7 @@ dotnet ef database update
 
 Export the local database
 ```
-pg_dump -U <db_user> -h localhost -p 5432 <db_name> > edumeilleur_dump.sql
+pg_dump -U postgres -h localhost -p 5432 -d EduMeilleurAPIContext --encoding=UTF8 -f edumeilleur_dump.sql
 ```
 
 Copy the dump file to the Raspberry Pi via SCP
@@ -84,7 +94,6 @@ Once created, import the dump file
 ```
 sudo -u postgres psql -d <db_name> < /home/adan/edumeilleur_dump.sql
 ```
-
 
 ### Nginx as Reverse Proxy & Static Server
 
@@ -122,16 +131,66 @@ Reload Nginx
 sudo systemctl reload nginx
 ```
 
-### How a Request Flows (local network)
+### Cloudflare Tunnel (Remote Access)
 
-1. User requests `http://<pi-ip>/` → Nginx serves Angular static files.
-2. The user interacts with the frontend, triggering an API request that starts with `http://<pi-ip>/api/`.
-3. Nginx forwards API request to ASP.NET Core backend at localhost:5000.
-4. Backend processes request and returns data.
-5. Nginx relays backend response to the client browser.
+To make the application accessible over the internet without port forwarding, a Cloudflare Tunnel is used.
+
+Authenticate and create a tunnel
+```
+cloudflared tunnel login
+cloudflared tunnel create edumeilleur
+```
+
+Create a config file at `/home/adan/.cloudflared/config.yml`
+```
+tunnel: 44bdd7a4-e7c4-42f2-9a93-ec6e26f2b050
+credentials-file: /home/adan/.cloudflared/44bdd7a4-e7c4-42f2-9a93-ec6e26f2b050.json
+
+ingress:
+  - hostname: edumeilleur.ca
+    service: http://localhost:80
+  - hostname: www.edumeilleur.ca
+    service: http://localhost:80
+  - hostname: app.edumeilleur.ca
+    service: http://localhost:80
+  - service: http_status:404
+```
+
+Create a systemd service to run the cloudflared tunnel automatically
+```
+[Unit]
+Description=Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/cloudflared tunnel run
+Restart=always
+User=adan
+Environment=HOME=/home/adan
+WorkingDirectory=/home/adan/.cloudflared
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service
+```
+sudo systemctl daemon-reload
+sudo systemctl enable cloudflared
+sudo systemctl start cloudflared
+```
+
+### How a Request Flows 
+
+1. User requests `https://edumeilleur.ca/` → Cloudflare Tunnel fowards request to Raspberry Pi and onto Nginx.
+2. Nginx serves Angular static files from `/var/www/angular`.
+3. Angular frontend triggers API requests to `/api`.
+4. Nginx proxies API requests to ASP.NET Core backend at `http://localhost:5000`.
+5. Backend processes request and returns data.
+6. Nginx relays backend response → Tunnel → Cloudflare → Client browser.
 
 ### TODO
 
-- Configure for HTTPS
-- Make accessible outside of local network
-- Add extra security mesures with nginx
+- Bash script for updating files.
+- Add workflow for updating database during production.

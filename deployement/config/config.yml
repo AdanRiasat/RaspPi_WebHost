@@ -1,0 +1,11 @@
+tunnel: 44bdd7a4-e7c4-42f2-9a93-ec6e26f2b050
+credentials-file: /home/adan/.cloudflared/44bdd7a4-e7c4-42f2-9a93-ec6e26f2b050.json
+
+ingress:
+  - hostname: edumeilleur.ca
+    service: http://localhost:80
+  - hostname: www.edumeilleur.ca
+    service: http://localhost:80
+  - hostname: app.edumeilleur.ca
+    service: http://localhost:80
+  - service: http_status:404
