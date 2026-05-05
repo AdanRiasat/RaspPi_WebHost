@@ -2,122 +2,178 @@
 
 Raspberry Pi 4 used as Web server host
 
-- OS: Debian
-- Headless setup: Connected via SSH from dev machine
+- OS: Raspbian lite 64 bit
+- Headless setup: Connected via tailscale SSH
 - Currently hosts: [EduMeilleur](https://github.com/AdanRiasat/EduMeilleur) (Angular, ASP.NET Core, PostgreSQL)
 
-## Deployment Workflow EduMeilleur
-
-### Angular
-
-Build on dev machine
+## Architecture Overview
+ 
+All services run as Docker containers managed by Docker Compose.
+ 
 ```
-ng build --configuration production
-```
-
-Copy the `dist/` files to the Raspberry Pi via SCP
-```
-scp -r dist/edu-meilleur/* adan@<pi-ip>:/home/adan/angular_tmp
-```
-
-Move the temporary files to the correct directory
-```
-sudo mv ~/angular_tmp/*  /var/www/angular/
-```
-
-Give permissions to the angular files so nginx can access them
-```
- sudo chown -R www-data:www-data /var/www/angular
-```
-
-### ASP.Net Core
-
-publish on dev machine
-```
-dotnet publish -c Release -r linux-arm64 --self-contained false -o ./publish
+GitHub Actions
+    │
+    ├── Builds multi-platform images (linux/amd64 + linux/arm64)
+    ├── Pushes to GHCR (ghcr.io/adanriasat/edumeilleur/*)
+    └── SSHs into Pi via Tailscale → docker compose pull && up -d
+                                            │
+                                       Pi (Docker)
+                              ┌────────────┴────────────┐
+                         cloudflared              nginx:alpine
+                         (Cloudflare               (port 80)
+                          Tunnel)                      │
+                                              ┌────────┴────────┐
+                                          frontend            api
+                                         (nginx:alpine)   (ASP.NET 8)
+                                                               │
+                                                           postgres:18
 ```
 
-Copy the published files to the Raspberry Pi via SCP
+### How a Request Flows
+ 
+1. User requests `https://edumeilleur.ca` → Cloudflare routes through the tunnel to the cloudflared container on the Pi
+2. cloudflared forwards to the nginx container on port 80
+3. Nginx serves Angular static files directly from the frontend container
+4. Angular triggers API calls to `/api/`
+5. Nginx proxies `/api/` to the ASP.NET Core api container on port 8080
+6. API queries PostgreSQL, returns response back through the chain
+
+### Docker containers
+
 ```
-scp -r ./publish/* adan@<pi-ip>:/home/adan/eduMeilleurApi
+# Frontend
+
+FROM node:18-alpine AS build
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build -- --configuration production
+
+FROM nginx:alpine
+COPY --from=build /app/dist/edu-meilleur/browser /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
 ```
 
-On the Raspberry Pi, run the backend:
 ```
-cd /home/adan/eduMeilleurApi/
-dotnet EduMeilleurAPI.dll
-```
-Create a systemd service to run the backend automatically
-```
-[Unit]
-Description=EduMeilleur ASP.NET Core Web API
-After=network.target
+# API
 
-[Service]
-WorkingDirectory=/home/adan/EduMeilleur
-ExecStart=/usr/bin/dotnet /home/adan/EduMeilleur/EduMeilleurAPI.dll
-Restart=always
-RestartSec=10
-SyslogIdentifier=EduMeilleurAPI
-User=adan
-Environment=ASPNETCORE_ENVIRONMENT=Production
-Environment=DOTNET_PRINT_TELEMETRY_MESSAGE=false
-Environment=ASPNETCORE_URLS=http://0.0.0.0:5000
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
 
-[Install]
-WantedBy=multi-user.target
-```
+RUN dotnet tool install --global dotnet-ef
+ENV PATH="$PATH:/root/.dotnet/tools"
 
-### PostgreSQL
+COPY EduMeilleurAPI/EduMeilleurAPI.csproj EduMeilleurAPI/
+RUN --mount=type=cache,id=nuget,target=/root/.nuget/packages \
+    dotnet restore EduMeilleurAPI/EduMeilleurAPI.csproj
 
-Update the database on dev machine
-```
-dotnet ef database update
+COPY . .
+WORKDIR /src/EduMeilleurAPI
+
+ARG TARGETARCH
+RUN dotnet publish -c Release -o /app/publish -r linux-$TARGETARCH --self-contained false
+
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+WORKDIR /app
+COPY --from=build /app/publish .
+ENTRYPOINT ["dotnet", "EduMeilleurAPI.dll"]
 ```
 
-Export the local database
 ```
-pg_dump -U postgres -h localhost -p 5432 -d EduMeilleurAPIContext --encoding=UTF8 -f edumeilleur_dump.sql
+# compose.yaml
+
+name: 'edumeilleur'
+
+services:
+  db:
+    image: postgres:18-alpine
+    env_file: '.env'
+    environment:
+      POSTGRES_USER: '${EDUMEILLEUR_POSTGRES_USER:?Add to .env}'
+      POSTGRES_PASSWORD: '${EDUMEILLEUR_POSTGRES_PASSWORD:?Add to .env}'
+      POSTGRES_DB: '${EDUMEILLEUR_POSTGRES_DATABASE:?Add to .env}'
+    volumes:
+      - pg-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${EDUMEILLEUR_POSTGRES_USER} -d ${EDUMEILLEUR_POSTGRES_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  
+  api:
+    image: ghcr.io/adanriasat/edumeilleur/api:latest
+    env_file: '.env'
+    environment:
+      ConnectionStrings__EduMeilleurAPIContext: "Host=${EDUMEILLEUR_POSTGRES_HOST};Port=5432;Database=${EDUMEILLEUR_POSTGRES_DATABASE};Username=${EDUMEILLEUR_POSTGRES_USER};Password=${EDUMEILLEUR_POSTGRES_PASSWORD}"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "
+        dotnet EduMeilleurAPI.dll
+      "
+    restart: unless-stopped
+
+  frontend:
+    image: ghcr.io/adanriasat/edumeilleur/frontend:latest
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports: 
+      - 80:80
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro,Z
+    depends_on:
+      - api
+      - frontend
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel run
+    restart: unless-stopped
+    depends_on:
+      - nginx
+    volumes:
+      - ./cloudflared:/etc/cloudflared
+
+volumes:
+  pg-data:
 ```
 
-Copy the dump file to the Raspberry Pi via SCP
-```
-scp edumeilleur_dump.sql adan@<pi-ip>:/home/adan/
-```
+## Nginx as Reverse Proxy
 
-On the Raspberry Pi, create the database
-```
-sudo -u postgres createdb <db_name>
-```
+Nginx runs as a container and acts as a reverse proxy. Static files are served by the frontend container, not by Nginx.
 
-Once created, import the dump file
 ```
-sudo -u postgres psql -d <db_name> < /home/adan/edumeilleur_dump.sql
-```
+# nginx.congf
 
-### Nginx as Reverse Proxy & Static Server
-
-Nginx listens on port 80 and serves static Angular files from `/var/www/angular`. It proxies API requests to the backend running on `http://localhost:5000`.
-
-Create a configuration file on the Raspberry Pi
-```
-sudo nano /etc/nginx/sites-available/edumeilleur
-```
-```
 server {
     listen 80;
     server_name _;
 
-    root /var/www/angular/browser;
-    index index.html;
-
     location / {
-        try_files $uri /index.html;
+        proxy_pass http://frontend:80;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_intercept_errors on;
+        error_page 404 = /index.html;
     }
 
-    location /api {
-        proxy_pass http://localhost:5000;
+    location /api/ {
+        proxy_pass http://api:8080/api/;
         proxy_http_version 1.1;
+
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection keep-alive;
         proxy_set_header Host $host;
@@ -126,71 +182,56 @@ server {
 }
 ```
 
-Reload Nginx
-```
-sudo systemctl reload nginx
-```
-
-### Cloudflare Tunnel (Remote Access)
+## Cloudflare Tunnel (Remote Access)
 
 To make the application accessible over the internet without port forwarding, a Cloudflare Tunnel is used.
 
-Authenticate and create a tunnel
 ```
-cloudflared tunnel login
-cloudflared tunnel create edumeilleur
-```
+# cloudflared/config.yaml
 
-Create a config file at `/home/adan/.cloudflared/config.yml`
-```
-tunnel: 44bdd7a4-e7c4-42f2-9a93-ec6e26f2b050
-credentials-file: /home/adan/.cloudflared/44bdd7a4-e7c4-42f2-9a93-ec6e26f2b050.json
+tunnel: TUNNEL_ID
+credentials-file: /etc/cloudflared/TUNNEL_ID.json
 
 ingress:
-  - hostname: edumeilleur.ca
-    service: http://localhost:80
-  - hostname: www.edumeilleur.ca
-    service: http://localhost:80
-  - hostname: app.edumeilleur.ca
-    service: http://localhost:80
+  - hostname: yourdomain.com
+    service: http://nginx:80
+
+  - hostname: api.yourdomain.com
+    service: http://nginx:80
+
   - service: http_status:404
 ```
 
-Create a systemd service to run the cloudflared tunnel automatically
+To create the tunnel credentials for the first time:
 ```
-[Unit]
-Description=Cloudflare Tunnel
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/cloudflared tunnel run
-Restart=always
-User=adan
-Environment=HOME=/home/adan
-WorkingDirectory=/home/adan/.cloudflared
-
-[Install]
-WantedBy=multi-user.target
+cloudflared tunnel login
+cloudflared tunnel create edumeilleur
+cp ~/.cloudflared/<tunnel-id>.json ~/EduMeilleur/cloudflared/
 ```
 
-Enable and start the service
+## CI/CD (GitHub Actions)
+ 
+On every push to `main`, the workflow:
+ 
+1. Builds multi-platform Docker images (`linux/amd64` + `linux/arm64`) using QEMU and buildx
+2. Pushes images to GHCR (`ghcr.io/adanriasat/edumeilleur/api:latest` and `frontend:latest`)
+3. Connects to the Pi via Tailscale using an auth key
+4. SSHs in and runs `docker compose pull && docker compose up -d`
+The Pi currently requires the files in `~/EduMeilleur/`: compose, env, nginx config, cloudflared config.
+ 
+Required GitHub secrets:
 ```
-sudo systemctl daemon-reload
-sudo systemctl enable cloudflared
-sudo systemctl start cloudflared
+GITHUB_TOKEN       ← automatic
+TS_AUTHKEY         ← Tailscale auth key (ephemeral)
+PI_HOST            ← Pi's Tailscale IP (100.x.x.x)
+PI_USER            ← SSH username
+PI_SSH_KEY         ← private SSH key
 ```
 
-### How a Request Flows 
+## Boot Behaviour
+ 
+All containers have `restart: unless-stopped`. The Docker daemon is enabled as a systemd service. On reboot, Docker starts automatically and brings all containers back up.
 
-1. User requests `https://edumeilleur.ca/` → Cloudflare Tunnel fowards request to Raspberry Pi and onto Nginx.
-2. Nginx serves Angular static files from `/var/www/angular`.
-3. Angular frontend triggers API requests to `/api`.
-4. Nginx proxies API requests to ASP.NET Core backend at `http://localhost:5000`.
-5. Backend processes request and returns data.
-6. Nginx relays backend response → Tunnel → Cloudflare → Client browser.
+## TODO
 
-### TODO
-
-- Bash script for updating files.
-- Add workflow for updating database during production.
+- WIFI recovery with USB script
