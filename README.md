@@ -147,6 +147,31 @@ volumes:
   pg-data:
 ```
 
+```
+# .env
+
+EDUMEILLEUR_POSTGRES_DATABASE='postgres'
+EDUMEILLEUR_POSTGRES_PASSWORD='edumeilleur'
+EDUMEILLEUR_POSTGRES_USER='edumeilleur'
+EDUMEILLEUR_POSTGRES_HOST='db'
+
+JWT__Key='superduperkey'
+JWT__Issuer='https://localhost:7027'
+JWT__Audience='http://localhost:4200'
+
+OpenRouter__ApiKey='superduperkey'
+
+Admin__Email='crazy@email.com'
+Admin__Password='edumeilleur'
+
+Teacher__Password='somepassword'
+Teacher2__Password='somepassword'
+Teacher3__Password='somepassword'
+Teacher4__Password='somepassword'
+Teacher5__Password='somepassword'
+```
+
+
 ## Nginx as Reverse Proxy
 
 Nginx runs as a container and acts as a reverse proxy. Static files are served by the frontend container, not by Nginx.
